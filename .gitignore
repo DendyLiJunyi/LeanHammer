@@ -1,0 +1,4 @@
+# Lake 的构建产物与依赖源码（716M，全部可由 lake build 重新生成）
+/.lake/
+
+.DS_Store
