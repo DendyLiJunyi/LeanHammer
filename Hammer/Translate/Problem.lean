@@ -1,39 +1,42 @@
 import Hammer.Translate.Encode
 
 /-!
-# 组装完整的 SMT-LIB 问题
+# Assembling the full SMT-LIB problem
 
-先翻目标（失败就整体失败），再逐条翻前提（失败就丢掉那一条）。
-断言带 `:named` 标签，这样求解器返回的 unsat core 能反查回 Lean 的引理名。
+The goal is translated first -- if that fails, the whole call fails. Premises follow one
+by one; a premise that cannot be translated is simply dropped. Every assert carries a
+`:named` label so the solver's unsat core can be mapped back to Lean lemma names.
 -/
 
 namespace Hammer
 
 open Lean Meta
 
-/-- 一个已经翻好、可以直接喂给求解器的问题。 -/
+/-- A translated problem, ready to hand to a solver. -/
 structure Encoded where
-  /-- SMT-LIB 2 文本。 -/
+  /-- The SMT-LIB 2 text. -/
   text     : String
-  /-- 断言标签 → 前提名。 -/
+  /-- Assert label to premise name. -/
   labels   : Std.HashMap String Name
-  /-- 成功翻译并断言的前提数。 -/
+  /-- How many premises were translated and asserted. -/
   asserted : Nat
-  /-- 因不可编码而丢弃的前提数。 -/
+  /-- How many premises were dropped as unencodable. -/
   dropped  : Nat
 
-/-- 跑一次编码器。 -/
+/-- Run the encoder. -/
 def EncM.run' (cfg : Hammer.Config) (x : EncM α) : MetaM (α × EncState) := do
   (x.run { cfg }).run {}
 
 /--
-把目标与前提编码成 SMT-LIB。返回的问题断言的是 **前提 ∧ ¬目标**，
-所以求解器给出 `unsat` 就等于"前提蕴含目标"。
+Encode the goal and its premises into SMT-LIB. The resulting problem asserts
+**premises ∧ ¬goal**, so `unsat` from the solver means exactly "the premises entail the
+goal".
 -/
 def encodeProblem (cfg : Hammer.Config) (goalType : Expr) (facts : Array Fact) :
     MetaM Encoded := do
   let go : EncM (Sexp × Array (String × Name) × Array Command × Nat) := do
-    -- 目标先翻：它决定了哪些排序/符号存在，也让报错第一时间暴露。
+    -- Translate the goal first: it fixes which sorts and symbols exist, and it
+    -- surfaces a failure immediately.
     let negGoal := Sexp.not' (← encodeForm goalType)
     let mut asserts : Array Command := #[]
     let mut labels : Array (String × Name) := #[]
@@ -44,7 +47,8 @@ def encodeProblem (cfg : Hammer.Config) (goalType : Expr) (facts : Array Fact) :
         catch _ => pure none
       match r? with
       | some s =>
-          -- 翻成恒真的前提没有信息量，只会拖慢求解器。
+          -- A premise that translates to `true` carries no information and only slows
+          -- the solver down.
           if s == Sexp.true' then
             dropped := dropped + 1
           else
@@ -58,10 +62,10 @@ def encodeProblem (cfg : Hammer.Config) (goalType : Expr) (facts : Array Fact) :
   let sideAsserts := st.sideAx.map fun a => Command.assert none a
   let commands :=
     st.decls
-      ++ (if sideAsserts.isEmpty then #[] else #[Command.raw "; Nat 非负性"])
+      ++ (if sideAsserts.isEmpty then #[] else #[Command.raw "; Nat non-negativity"])
       ++ sideAsserts
       ++ asserts
-      ++ #[Command.raw "; 取反后的目标", Command.assert (some "goal") negGoal]
+      ++ #[Command.raw "; negated goal", Command.assert (some "goal") negGoal]
   let problem : Problem := { produceCores := cfg.unsatCores, commands := commands }
   return {
     text := problem.render

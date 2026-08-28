@@ -2,27 +2,30 @@ import Hammer.Translate.Encode
 import Hammer.Premise.Features
 
 /-!
-# 单态化
+# Monomorphization
 
-Mathlib 的引理几乎全是多态的：`∀ {α : Type u} [inst : Monoid α], …`。一阶编码器碰到
-`∀ (α : Type u)` 只能放弃，所以必须先把类型变量替换成目标里真实出现的具体类型，
-再用 `synthInstance` 补齐类型类参数。
+Mathlib lemmas are almost all polymorphic: `∀ {α : Type u} [inst : Monoid α], …`. A
+first-order encoder has no choice but to give up on `∀ (α : Type u)`, so type variables
+must first be replaced by concrete types that actually occur in the goal, with type class
+arguments filled in by `synthInstance`.
 
-策略是"目标驱动"的：候选类型只来自目标与局部上下文。这正是 hammer 在实践中管用的
-原因——不需要枚举整个类型宇宙，用户想证的东西已经把类型说清楚了。
+The strategy is goal-driven: candidate types come only from the goal and the local
+context. This is precisely why hammers work in practice -- there is no need to enumerate
+the universe of types, because what the user is trying to prove already pins them down.
 -/
 
 namespace Hammer
 
 open Lean Meta
 
-/-- `a` 是否是一个适合拿来实例化类型变量的具体类型。 -/
+/-- Whether `a` is a concrete type suitable for instantiating a type variable. -/
 private def isTypeCandidate (a : Expr) : MetaM Bool := do
   if a.hasExprMVar || a.hasLooseBVars then return false
   if a.isSort || a.isForall then return false
   let t ← whnfR (← inferType a)
   unless t.isSort do return false
-  -- `Prop` 不作为实例化目标：编码器把命题当 `Bool`，实例化到 `Prop` 收益很小。
+  -- `Prop` is not an instantiation target: the encoder already treats propositions as
+  -- `Bool`, so instantiating at `Prop` buys very little.
   if t matches .sort .zero then return false
   if (← isClass? a).isSome then return false
   return true
@@ -49,18 +52,18 @@ private partial def gather (e : Expr) : GatherM Unit := do
   | .proj _ _ b => gather b
   | _ => pure ()
 
-/-- 从目标与局部假设里收集实例化用的具体类型。 -/
+/-- Collect the concrete types to instantiate with, from the goal and its hypotheses. -/
 def collectGroundTypes (es : Array Expr) : MetaM (Array Expr) := do
   let go : GatherM Unit := do
     for e in es do
       gather e
-      -- 表达式本身也可能就是一个类型。
+      -- The expression itself may be a type.
       if !e.hasLooseBVars then
         if ← isTypeCandidate e then record e
   let (_, (_, types)) ← go.run (∅, #[])
   return types
 
-/-- 剥掉前导的类型绑定与实例绑定，换成元变量。 -/
+/-- Peel off leading type and instance binders, replacing them with metavariables. -/
 private partial def peelBinders (e ty : Expr) (tms : Array Expr) (ims : Array MVarId) :
     MetaM (Expr × Expr × Array Expr × Array MVarId) := do
   let ty ← if ty.isForall then pure ty else whnfR ty
@@ -76,7 +79,8 @@ private partial def peelBinders (e ty : Expr) (tms : Array Expr) (ims : Array MV
         return (e, ty, tms, ims)
   | _ => return (e, ty, tms, ims)
 
-/-- 把类型变量赋成 `assign` 的一次尝试；实例参数交给类型类合成。 -/
+/-- One attempt at assigning the type variables from `assign`; instance arguments are
+left to type class synthesis. -/
 private def tryInstantiate (f : Fact) (ci : ConstantInfo) (assign : Array Expr) :
     MetaM (Option Fact) := withoutModifyingState do
   let lvls ← ci.levelParams.mapM fun _ => mkFreshLevelMVar
@@ -99,7 +103,7 @@ private def tryInstantiate (f : Fact) (ci : ConstantInfo) (assign : Array Expr) 
   return some { f with
     type := resTy, proof := e, symbols := featuresOf resTy, isPoly := false }
 
-/-- `types` 上长度为 `k` 的全部组合，总数封顶 `cap`。 -/
+/-- All length-`k` tuples over `types`, capped at `cap` in total. -/
 private def tuples (types : Array Expr) (k : Nat) (cap : Nat) : Array (Array Expr) := Id.run do
   let mut acc : Array (Array Expr) := #[#[]]
   for _ in [0:k] do
@@ -110,17 +114,18 @@ private def tuples (types : Array Expr) (k : Nat) (cap : Nat) : Array (Array Exp
     acc := next
   return acc
 
-/-- 把一条（可能多态的）引理实例化成若干条单态引理。 -/
+/-- Instantiate one possibly-polymorphic lemma into a set of monomorphic ones. -/
 def monomorphizeFact (cfg : Hammer.Config) (f : Fact) (types : Array Expr) :
     MetaM (Array Fact) := do
   if f.isLocal || !f.isPoly then return #[f]
   let some ci := (← getEnv).find? f.name | return #[]
-  -- 先数一下要填几个类型变量。
+  -- First count how many type variables need filling.
   let k ← withoutModifyingState do
     let lvls ← ci.levelParams.mapM fun _ => mkFreshLevelMVar
     let (_, _, tms, _) ← peelBinders (mkConst f.name lvls) (ci.instantiateTypeLevelParams lvls) #[] #[]
     return tms.size
-  -- 类型变量太多就放弃：组合爆炸，且这类引理通常也不是目标要的。
+  -- Too many type variables: the combinatorics blow up, and such lemmas are rarely
+  -- what the goal needs anyway.
   if k > 2 then return #[]
   let mut out : Array Fact := #[]
   let mut seen : Std.HashSet ExprStructEq := ∅

@@ -4,34 +4,39 @@ import Hammer.Translate.SMTLib
 import Hammer.Premise.Features
 
 /-!
-# Lean `Expr` → SMT-LIB 的编码
+# Encoding Lean `Expr` into SMT-LIB
 
-这是整条链路里唯一有"内容"的一步。CIC 比多排序一阶逻辑表达力强得多，所以翻译必然
-是部分的。设计取舍如下：
+This is the only step in the pipeline with real content. CIC is far more expressive than
+many-sorted first-order logic, so the translation is necessarily partial. The trade-offs:
 
-* **看得懂的就精确翻译**：命题连接词、量词、等式、`Nat`/`Int`/`Real` 上的算术与比较。
-* **看不懂的就抽象成不解释符号**。抽象是保 `unsat` 的：它只会丢掉等式信息，让问题
-  更难而不是更容易，所以求解器说 `unsat` 时结论依然可信。
-* **翻译失败的前提直接丢掉**，只有目标翻译失败才算整体失败。
+* **Translate precisely what we understand**: propositional connectives, quantifiers,
+  equality, and arithmetic and comparisons over `Nat` / `Int` / `Real`.
+* **Abstract everything else into uninterpreted symbols.** Abstraction preserves `unsat`:
+  it only discards equational information, making the problem harder rather than easier,
+  so a solver's `unsat` verdict remains trustworthy.
+* **Drop premises that fail to translate.** Only a failure on the goal aborts the call.
 
-## `Nat` 的处理
+## Handling `Nat`
 
-`Nat` 映射到 SMT 的 `Int`，并为每个 `Nat` 量词加 `≥ 0` 守卫、为每个返回 `Nat` 的
-符号加非负公理。截断减法 `a - b` 翻成 `(ite (<= b a) (- a b) 0)`；除法/取模按 Lean 的
-"除以 0 得 0 / 得被除数"补 `ite` 守卫。Lean 的 `Int` 除法恰好就是 SMT-LIB 的欧几里得
-`div`/`mod`（已实测：`(-7)/2 = -4`，`(-7)%2 = 1`），所以只需补零除守卫。
+`Nat` maps to SMT's `Int`, with a `≥ 0` guard on every `Nat` quantifier and a
+non-negativity axiom for every symbol returning `Nat`. Truncated subtraction `a - b`
+becomes `(ite (<= b a) (- a b) 0)`; division and modulo get `ite` guards matching Lean's
+"division by zero is zero, modulo by zero is the dividend". Lean's `Int` division happens
+to be exactly SMT-LIB's Euclidean `div` / `mod` (measured: `(-7)/2 = -4`, `(-7)%2 = 1`),
+so only the zero-divisor guard is needed.
 
-## 已知的不完备与风险
+## Known incompleteness and risk
 
-SMT 假设每个排序非空，而 Lean 的类型可以是空的。对空类型上的 `∃` 这会引入不健全。
-本项目的收尾本来就是信任公理，这个洞记在这里，逆向翻译会一并堵上。
+SMT assumes every sort is nonempty, whereas Lean types can be empty, which is unsound for
+`∃` over an empty type. See `Config.assumeNonempty`: by default we require a synthesizable
+`Nonempty` instance before declaring an uninterpreted sort.
 -/
 
 namespace Hammer
 
 open Lean Meta
 
-/-- 一个 SMT 排序，外加"它其实来自 Lean 的 `Nat`"这一位信息。 -/
+/-- An SMT sort, plus one bit recording that it really came from Lean's `Nat`. -/
 structure SortInfo where
   smt   : String
   isNat : Bool := false
@@ -42,24 +47,27 @@ def SortInfo.int  : SortInfo := ⟨"Int", false⟩
 def SortInfo.nat  : SortInfo := ⟨"Int", true⟩
 def SortInfo.real : SortInfo := ⟨"Real", false⟩
 
-/-- 编码器的只读环境：SMT 量词绑定的变量，以及配置。 -/
+/-- The encoder's read-only environment: variables bound by SMT quantifiers, plus the
+configuration. -/
 structure EncCtx where
   bound : Std.HashMap FVarId (String × SortInfo) := ∅
   cfg   : Hammer.Config := {}
 
-/-- 编码器的可变状态。`decls` 按首次使用顺序累积，因此天然满足"先声明后使用"。 -/
+/-- The encoder's mutable state. `decls` accumulates in order of first use, which
+automatically satisfies SMT-LIB's declare-before-use requirement. -/
 structure EncState where
   sorts   : Std.HashMap ExprStructEq SortInfo := ∅
   syms    : Std.HashMap ExprStructEq (String × SortInfo) := ∅
   decls   : Array Command := #[]
-  /-- 由声明附带产生的公理，例如 `Nat` 符号的非负性。 -/
+  /-- Axioms emitted alongside a declaration, e.g. non-negativity for `Nat` symbols. -/
   sideAx  : Array Sexp := #[]
   used    : Std.HashSet String := ∅
   counter : Nat := 0
 
 abbrev EncM := ReaderT EncCtx (StateRefT EncState MetaM)
 
-/-- 抽象键里占位"已翻译的值参数"的哑常量。只用于哈希，不会被繁饰。 -/
+/-- Placeholder standing for a translated value argument inside an abstraction key. Used
+only for hashing; never elaborated. -/
 private def hole : Expr := mkConst `Hammer.«_hole»
 
 private def freshSym (base : String) : EncM String := do
@@ -78,11 +86,12 @@ private def freshVar : EncM String := do
   return s!"x{s.counter}"
 
 /--
-`e` 是否提到了当前处于 SMT 量词作用域内的变量。
+Whether `e` mentions a variable currently in scope of an SMT quantifier.
 
-这是两类不健全的共同来源：把 `Fin n` 抽象成一个与 `n` 无关的排序，或者把
-`@Foo n a` 抽象成一个与 `n` 无关的符号——依赖一旦丢掉，一条真命题就会变成矛盾。
-（`Fin.pos : ∀ {n} (i : Fin n), 0 < n` 正是这样把整个问题变成 unsat 的。）
+This is the shared source of two unsoundnesses: abstracting `Fin n` into a sort
+independent of `n`, or abstracting `@Foo n a` into a symbol independent of `n`. Once the
+dependency is lost, a true statement turns into a contradiction.
+(`Fin.pos : ∀ {n} (i : Fin n), 0 < n` did exactly that, making every problem unsat.)
 -/
 private def mentionsBound (e : Expr) : EncM Bool := do
   let bound := (← read).bound
@@ -92,40 +101,41 @@ private def mentionsBound (e : Expr) : EncM Bool := do
 private def intLit (i : Int) : Sexp :=
   if i < 0 then Sexp.mk "-" [.atom (toString (-i))] else .atom (toString i)
 
-/-- 从一个表达式猜一个可读的 SMT 符号基名。 -/
+/-- Guess a readable base name for an SMT symbol from an expression. -/
 private def baseNameOf (e : Expr) : MetaM String := do
   match e.getAppFn with
   | .const n _ => return sanitize n
   | .fvar fid  => return sanitize (← fid.getUserName)
   | _          => return "t"
 
-/-- 类型 → SMT 排序。不可编码时抛错（调用方决定是丢前提还是整体失败）。 -/
+/-- Type to SMT sort. Throws when unencodable; the caller decides whether to drop the
+premise or fail outright. -/
 partial def toSortInfo (t : Expr) : EncM SortInfo := do
   let t ← instantiateMVars t
   let t ← whnfR t
   match t with
-  | .sort u => if u.isZero then return .bool else throwError "sort {t} 不可编码"
-  | .forallE .. => throwError "函数类型 {t} 是高阶的，不可编码"
+  | .sort u => if u.isZero then return .bool else throwError "sort {t} is not encodable"
+  | .forallE .. => throwError "function type {t} is higher-order and not encodable"
   | _ =>
-    if ← isProp t then throwError "{t} 是命题，它的元素是证明"
-    if (← isClass? t).isSome then throwError "{t} 是类型类"
+    if ← isProp t then throwError "{t} is a proposition; its elements are proofs"
+    if (← isClass? t).isSome then throwError "{t} is a type class"
     match t.getAppFnArgs with
     | (``Nat, _)  => return .nat
     | (``Int, _)  => return .int
     | (``Bool, _) => return .bool
-    -- `Real` / `Rat` 来自 Mathlib，这里按名字认，不引依赖。
+    -- `Real` / `Rat` come from Mathlib; match on the name so we need no dependency.
     | (n, _) =>
       if n == `Real || n == `Rat || n == `NNRat then return .real
       if ← mentionsBound t then
-        throwError "类型 {t} 依赖于被量化的变量，抽象成排序会丢掉依赖"
+        throwError "type {t} depends on a quantified variable; abstracting it into a sort would discard that dependency"
       let key : ExprStructEq := t
       if let some si := (← get).sorts[key]? then return si
-      if t.hasExprMVar then throwError "类型 {t} 含元变量"
+      if t.hasExprMVar then throwError "type {t} contains metavariables"
       unless (← read).cfg.assumeNonempty do
         let .sort u ← whnfR (← inferType t)
-          | throwError "{t} 不是一个类型"
+          | throwError "{t} is not a type"
         unless (← trySynthInstance (mkApp (mkConst ``Nonempty [u]) t)) matches .some _ do
-          throwError "无法确认 {t} 非空；SMT 排序必须非空"
+          throwError "cannot establish that {t} is nonempty; SMT sorts must be nonempty"
       let nm ← freshSym (← baseNameOf t)
       let si : SortInfo := ⟨nm, false⟩
       modify fun s => { s with
@@ -133,14 +143,16 @@ partial def toSortInfo (t : Expr) : EncM SortInfo := do
         decls := s.decls.push (.declareSort nm) }
       return si
 
-/-- 一个参数能否作为"值"翻译；否则它属于符号的身份（类型参数、实例、证明）。 -/
+/-- Whether an argument can be translated as a value. If not, it belongs to the symbol's
+identity instead (type arguments, instances, proofs). -/
 private def classifyArg (a : Expr) : EncM (Option SortInfo) := do
   try
     let t ← inferType a
     return some (← toSortInfo t)
   catch _ => return none
 
-/-- 内建算术：返回 (SMT 算子标记, 参数)。标记是内部记号，不直接是 SMT 名字。 -/
+/-- Built-in arithmetic, returning an operator tag and its arguments. The tag is our own
+notation, not directly an SMT name. -/
 private def arithOp? (e : Expr) : Option (String × Array Expr) :=
   match e.getAppFnArgs with
   | (``HAdd.hAdd, #[_,_,_,_,a,b]) => some ("+", #[a,b])
@@ -161,7 +173,7 @@ private def arithOp? (e : Expr) : Option (String × Array Expr) :=
   | (``Nat.succ,  #[a])           => some ("succ", #[a])
   | _ => none
 
-/-- 内建比较：返回 SMT 关系名与两个参数。 -/
+/-- Built-in comparisons, returning the SMT relation name and both arguments. -/
 private def cmpOp? (e : Expr) : Option (String × Expr × Expr) :=
   match e.getAppFnArgs with
   | (``LT.lt, #[_,_,a,b]) => some ("<", a, b)
@@ -174,13 +186,14 @@ private def cmpOp? (e : Expr) : Option (String × Expr × Expr) :=
   | (``Int.le, #[a,b])    => some ("<=", a, b)
   | _ => none
 
-/-- 把 `p : α → Prop` 化成 `(binder 名, 定义域, 体)`，必要时做 η 展开。 -/
+/-- Split `p : α → Prop` into a binder name and a body, eta-expanding when needed. -/
 private def asPredicate (p : Expr) : MetaM (Name × Expr) := do
   match p with
   | .lam n _ b _ => return (n, b)
   | _ => return (`x, mkApp p (.bvar 0) |>.liftLooseBVars 0 0)
 
-/-- 返回 `Nat` 的符号的非负公理，参数里的 `Nat` 也加上守卫。 -/
+/-- Non-negativity axiom for a symbol returning `Nat`, with guards on any `Nat`
+arguments. -/
 private def mkNatBound (nm : String) (argSorts : Array SortInfo) : EncM Sexp := do
   if argSorts.isEmpty then
     return Sexp.mk ">=" [.atom nm, .atom "0"]
@@ -198,14 +211,14 @@ private def mkNatBound (nm : String) (argSorts : Array SortInfo) : EncM Sexp := 
 
 mutual
 
-/-- 把一个命题翻成 SMT 公式。 -/
+/-- Translate a proposition into an SMT formula. -/
 partial def encodeForm (e : Expr) : EncM Sexp := do
   let e ← instantiateMVars e
   match e with
   | .forallE n d b _ =>
       if ← isProp d then
         if b.hasLooseBVars then
-          throwError "依赖于证明的 ∀ 不可编码"
+          throwError "a ∀ whose body depends on the proof is not encodable"
         return Sexp.implies (← encodeForm d) (← encodeForm b)
       else
         let si ← toSortInfo d
@@ -239,19 +252,19 @@ partial def encodeForm (e : Expr) : EncM Sexp := do
     | (``ite, #[α, c, _, t, f]) =>
         if ← isProp α then
           return Sexp.mk "ite" [← encodeForm c, ← encodeForm t, ← encodeForm f]
-        else throwError "ite 的分支不是命题"
+        else throwError "the branches of this ite are not propositions"
     | _ =>
       if let some (op, a, b) := cmpOp? e then
         let (ta, sa) ← encodeTerm a
         let (tb, _)  ← encodeTerm b
         if sa.smt == "Int" || sa.smt == "Real" then
           return Sexp.mk op [ta, tb]
-        else throwError "比较的排序 {sa.smt} 不是数值"
+        else throwError "comparison sort {sa.smt} is not numeric"
       let (s, si) ← encodeApp e
-      if si.smt != "Bool" then throwError "{e} 不是命题"
+      if si.smt != "Bool" then throwError "{e} is not a proposition"
       return s
 
-/-- `a = b` / `a ≠ b`：命题上的等号退化成 `↔`。 -/
+/-- `a = b` and `a ≠ b`. Equality between propositions degenerates to `↔`. -/
 partial def encodeEq (α a b : Expr) (negated : Bool) : EncM Sexp := do
   let eq ←
     if (← whnfR α) matches .sort .zero then
@@ -262,10 +275,10 @@ partial def encodeEq (α a b : Expr) (negated : Bool) : EncM Sexp := do
       pure (Sexp.mk "=" [ta, tb])
   return if negated then Sexp.not' eq else eq
 
-/-- 把一个项翻成 SMT 项，同时给出它的排序。 -/
+/-- Translate a term into an SMT term, along with its sort. -/
 partial def encodeTerm (e : Expr) : EncM (Sexp × SortInfo) := do
   let e ← instantiateMVars e
-  -- 命题当作 `Bool` 项。
+  -- Propositions become `Bool` terms.
   if ← isProp (← inferType e) then
     return (← encodeForm e, .bool)
   match e with
@@ -273,7 +286,7 @@ partial def encodeTerm (e : Expr) : EncM (Sexp × SortInfo) := do
   | .letE .. => encodeTerm (← whnf e)
   | _ =>
   let si ← toSortInfo (← inferType e)
-  -- 数值字面量
+  -- Numeric literals
   if si.smt == "Int" then
     if let some n := e.nat? then return (intLit (Int.ofNat n), si)
     if let some i := e.int? then return (intLit i, si)
@@ -291,7 +304,7 @@ partial def encodeTerm (e : Expr) : EncM (Sexp × SortInfo) := do
       return (← encodeArith op args si, si)
   encodeApp e
 
-/-- 算术算子，按 Lean 的全函数语义补守卫。 -/
+/-- Arithmetic operators, guarded to match Lean's total-function semantics. -/
 partial def encodeArith (op : String) (args : Array Expr) (si : SortInfo) : EncM Sexp := do
   let enc (i : Nat) : EncM Sexp := return (← encodeTerm args[i]!).1
   match op with
@@ -301,7 +314,7 @@ partial def encodeArith (op : String) (args : Array Expr) (si : SortInfo) : EncM
   | "succ" => return Sexp.mk "+" [← enc 0, .atom "1"]
   | "-" =>
       let a ← enc 0; let b ← enc 1
-      -- `Nat` 的减法是截断的。
+      -- Subtraction on `Nat` is truncated.
       if si.isNat then
         return Sexp.mk "ite" [Sexp.mk "<=" [b, a], Sexp.mk "-" [a, b], .atom "0"]
       else
@@ -309,21 +322,21 @@ partial def encodeArith (op : String) (args : Array Expr) (si : SortInfo) : EncM
   | "/" =>
       let a ← enc 0; let b ← enc 1
       if si.smt == "Real" then
-        -- Lean 里 `x / 0 = 0`。
+        -- In Lean, `x / 0 = 0`.
         return Sexp.mk "ite" [Sexp.mk "=" [b, .atom "0.0"], .atom "0.0", Sexp.mk "/" [a, b]]
       else
         return Sexp.mk "ite" [Sexp.mk "=" [b, .atom "0"], .atom "0", Sexp.mk "div" [a, b]]
   | "%" =>
       let a ← enc 0; let b ← enc 1
-      if si.smt == "Real" then throwError "Real 上没有 %"
-      -- Lean 里 `n % 0 = n`。
+      if si.smt == "Real" then throwError "there is no % on Real"
+      -- In Lean, `n % 0 = n`.
       return Sexp.mk "ite" [Sexp.mk "=" [b, .atom "0"], a, Sexp.mk "mod" [a, b]]
-  | _ => throwError "未知算子 {op}"
+  | _ => throwError "unknown operator {op}"
 
-/-- 兜底：把 `e` 当成一个不解释符号的应用。 -/
+/-- Fallback: treat `e` as an application of an uninterpreted symbol. -/
 partial def encodeApp (e : Expr) : EncM (Sexp × SortInfo) := do
   let e := e.headBeta
-  -- SMT 量词绑定的变量。
+  -- A variable bound by an SMT quantifier.
   if let .fvar fid := e then
     if let some (v, si) := (← read).bound[fid]? then
       return (.atom v, si)
@@ -332,19 +345,20 @@ partial def encodeApp (e : Expr) : EncM (Sexp × SortInfo) := do
   let args := e.getAppArgs
   if let .fvar fid := f then
     if (← read).bound.contains fid && !args.isEmpty then
-      throwError "对量词变量的高阶应用不可编码"
+      throwError "higher-order application of a quantified variable is not encodable"
   let kinds ← args.mapM classifyArg
-  -- 值参数被翻译；其余参数并入符号的身份，等价于就地单态化。
+  -- Value arguments get translated; the rest fold into the symbol's identity, which
+  -- amounts to monomorphizing on the spot.
   let keyE : Expr :=
     mkAppN f (args.zipWith (fun a k => if k.isSome then hole else a) kinds)
   let key : ExprStructEq := keyE
   let valueArgs := (args.zip kinds).filterMap fun (a, k) => k.map (a, ·)
   if ← mentionsBound keyE then
-    throwError "{e} 的不解释部分依赖于被量化的变量"
+    throwError "the uninterpreted part of {e} depends on a quantified variable"
   if let some (nm, _) := (← get).syms[key]? then
     let encoded ← valueArgs.mapM fun (a, _) => return (← encodeTerm a).1
     return (Sexp.mk nm encoded.toList, si)
-  if keyE.hasExprMVar then throwError "{e} 含元变量"
+  if keyE.hasExprMVar then throwError "{e} contains metavariables"
   let nm ← freshSym (← baseNameOf e)
   let argSorts := valueArgs.map (·.2)
   modify fun s => { s with
