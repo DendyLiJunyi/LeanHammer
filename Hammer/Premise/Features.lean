@@ -1,37 +1,39 @@
 import Hammer.Util
 
 /-!
-# 前提的特征
+# Premise features
 
-一条引理的"特征"就是它陈述里出现的常量名集合。前提选择完全建立在这上面：
-和目标共享稀有符号的引理更可能有用。
+A lemma's "features" are simply the constant names occurring in its statement. Premise
+selection rests entirely on these: a lemma sharing rare symbols with the goal is far more
+likely to be useful.
 -/
 
 namespace Hammer
 
 open Lean
 
-/-- 一条候选前提。 -/
+/-- One candidate premise. -/
 structure Fact where
-  /-- 展示用的名字（全局常量名，或局部假设的用户名）。 -/
+  /-- Display name: the global constant name, or the user name of a local hypothesis. -/
   name    : Name
-  /-- 命题本身。 -/
+  /-- The proposition itself. -/
   type    : Expr
-  /-- 证明项：局部假设是 `fvar`，全局引理是 `mkConst`（可能带宇宙参数）。 -/
+  /-- Proof term: an `fvar` for local hypotheses, `mkConst` (possibly with universe
+  parameters) for global lemmas. -/
   proof   : Expr
-  /-- 出现在 `type` 里的常量，已滤掉逻辑连接词。 -/
+  /-- Constants occurring in `type`, with logical connectives filtered out. -/
   symbols : Std.HashSet Name
-  /-- 局部假设永远进入最终问题，不参与相关度打分。 -/
+  /-- Local hypotheses always enter the final problem and skip relevance scoring. -/
   isLocal : Bool := false
-  /-- 陈述里还有未被实例化的类型/宇宙变量。 -/
+  /-- The statement still has uninstantiated type or universe variables. -/
   isPoly  : Bool := false
 
-/-- 提取特征符号：去掉逻辑骨架，只留"内容"符号。 -/
+/-- Extract feature symbols: drop the logical skeleton, keep the content. -/
 def featuresOf (e : Expr) : Std.HashSet Name :=
   (constantsIn e).fold (init := ∅) fun acc n =>
     if logicalSymbols.contains n || isNoise n then acc else acc.insert n
 
-/-- 一条引理的"体积"，用来惩罚超长的陈述。 -/
+/-- Rough size of a statement, used to penalize very long lemmas. -/
 partial def sizeOf' (e : Expr) : Nat :=
   match e with
   | .app f a       => 1 + sizeOf' f + sizeOf' a

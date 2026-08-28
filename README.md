@@ -1,173 +1,192 @@
 # lean-smt-hammer
 
-一个 Lean 4 tactic，跑完整条 hammer 流水线，后端是 SMT 求解器。
+A Lean 4 tactic that runs the full hammer pipeline against SMT solvers.
 
-> 和社区的 [LeanHammer](https://github.com/JOSHCLUNE/LeanHammer)（lean-auto + Duper）
-> 不是同一个项目。那个的翻译目标是 TPTP/一阶，重建全靠 Duper；这个的翻译目标是
-> SMT-LIB，主力是 z3 / cvc5 的判定过程，Duper 只在最后一步用来把 unsat core
-> 换成真证明。
+> Not the same project as the community's
+> [LeanHammer](https://github.com/JOSHCLUNE/LeanHammer) (lean-auto + Duper). That one
+> translates to TPTP / first-order logic and reconstructs entirely with Duper. This one
+> translates to SMT-LIB, leans on z3 / cvc5's decision procedures for the heavy lifting,
+> and only uses Duper at the very end to turn an unsat core into a real proof.
 
 ```
-目标 + 局部上下文
+goal + local context
   │
-  ├─① 前提收集      扫 Environment，取出所有 theorem 作候选池
-  ├─② 相关度过滤    MePo 风格迭代扩张，按稀有符号加权，选出 ~100 条
-  ├─③ 单态化        用目标里出现的具体类型实例化多态引理，synthInstance 补实例参数
-  ├─④ 编码 + 求解   翻成 SMT-LIB 2，并行跑 z3 / cvc5，取 unsat core
+  ├─(1) premise collection   scan the Environment, take every theorem as a candidate
+  ├─(2) relevance filtering  MePo-style iterative expansion, rare symbols weighted higher
+  ├─(3) monomorphization     instantiate polymorphic lemmas at the goal's concrete types,
+  │                          filling instance arguments via synthInstance
+  ├─(4) encoding + solving   translate to SMT-LIB 2, race z3 / cvc5, take the unsat core
   │
-  └─⑤ 逆向翻译      把 core 交给 Duper 在 Lean 内部重证 —— 部分覆盖，见下
+  └─(5) reconstruction       hand the core to Duper to reprove inside Lean -- partial
 ```
 
-前四步是主体。第 ⑤ 步走的是"外包"路线：外部求解器负责在几万条引理里**搜索**，
-Duper（一个跑在 Lean 里的 superposition 证明器）负责在 core 那几条引理上**重建**。
+Steps 1-4 are the bulk of the work. Step 5 takes the outsourcing route: the external
+solver does the *search* across tens of thousands of lemmas, and Duper (a superposition
+prover running inside Lean) does the *rebuilding* over the handful in the core.
 
-* 重建成功 → 目标由真正的证明项闭合，`#print axioms` 干净。
-* 重建失败 → 退回公理 `Hammer.trustSMT : ∀ p : Prop, p`，报告如实说明。
+* Reconstruction succeeds: the goal is closed by a genuine proof term, and
+  `#print axioms` is clean.
+* Reconstruction fails: fall back to the axiom `Hammer.trustSMT : ∀ p : Prop, p`, and say
+  so in the report.
 
 ```lean
 theorem demo (l₁ l₂ : List Nat) : (l₁ ++ l₂).length = l₁.length + l₂.length := by hammer
--- hammer: z3 判定 unsat（18ms）· 前提 96 选中 → 170 单态化 → 137 已断言（丢弃 33）
--- unsat core 用到的前提：
+-- hammer: z3 returned unsat (18ms) · premises: 96 selected → 170 monomorphized →
+--   137 asserted (33 dropped)
+-- premises in the unsat core:
 --   · List.length_append
--- 目标已由 Duper 重建的证明项闭合 —— 这是真证明，不含 `trustSMT`。
+-- goal closed by a proof term reconstructed with Duper — a real proof, no `trustSMT`.
 #print axioms demo
 -- 'demo' depends on axioms: [propext, Classical.choice, Quot.sound]
 ```
 
-即使重建失败，报告本身也有用：它告诉你哪几条引理足以推出目标，可以拿去喂
-`omega` / `simp` 换一个真证明。
+Even when reconstruction fails the report earns its keep: it names the lemmas that suffice
+to derive the goal, which you can then feed to `omega` or `simp` for a real proof.
 
-## 逆向翻译的实际覆盖面
+## How much actually gets reconstructed
 
-`HammerTest/Reconstruct.lean` 拿 19 个目标做了实测（`#print axioms` 判定）：
+`HammerTest/Reconstruct.lean` measures this over 19 goals, adjudicated by `#print axioms`:
 
-| 类别 | 重建成功 | 说明 |
+| Category | Reconstructed | Notes |
 | --- | --- | --- |
-| 命题逻辑 | 3 / 3 | Duper 的主场 |
-| 不解释函数与等式 | 3 / 3 | 同上 |
-| 量词 | 2 / 2 | 同上 |
-| 需要 environment 引理 | 2 / 2 | `List.length_append` 一类 |
-| 整数/自然数算术 | 2 / 9 | **主要缺口** |
-| **合计** | **12 / 19** | |
+| Propositional logic | 3 / 3 | Duper's home turf |
+| Uninterpreted functions and equality | 3 / 3 | likewise |
+| Quantifiers | 2 / 2 | likewise |
+| Needs a lemma from the environment | 2 / 2 | `List.length_append` and friends |
+| Integer / natural arithmetic | 2 / 9 | **the main gap** |
+| **Total** | **12 / 19** | |
 
-缺口的原因很明确：**Duper 是纯一阶等式推理，没有算术决策过程**。
-`a ≤ b → a ≤ b + 1`、`n - (n+1) = 0`、`n / 0 = 0` 这些目标的 core 里往往只有一两条假设，
-真正的工作全在 z3 的线性算术理论里——这部分 Duper 接不住。
-（成功的那两个是特例：`x < y → x + 1 ≤ y` 在 `Int` 上有现成引理，
-`(-7)/2 = -4` 是闭项可计算。）
+The reason for the gap is clear: **Duper is pure first-order equational reasoning with no
+arithmetic decision procedure**. For goals like `a ≤ b → a ≤ b + 1`, `n - (n+1) = 0`, or
+`n / 0 = 0`, the core often holds just one or two hypotheses while all the real work sits
+in z3's linear arithmetic theory -- which Duper cannot pick up. (The two that do succeed
+are special cases: `x < y → x + 1 ≤ y` has a ready-made lemma on `Int`, and `(-7)/2 = -4`
+is a closed term that computes.)
 
-时间代价很低：19 个目标总共只多花 ~0.6 秒（约 30ms/个）。
-Duper 要么很快成功，要么很快放弃。
+The time cost is small: about 0.6 seconds across all 19 goals, roughly 30ms each. Duper
+either succeeds quickly or gives up quickly.
 
-## 安装
+## Installation
 
-需要 z3 和 cvc5 在 `PATH` 上（至少一个）。
+Needs z3 and cvc5 on `PATH` (at least one of them).
 
 ```bash
 brew install z3
-# cvc5 不在 homebrew 里，从 release 拿二进制：
+# cvc5 is not in homebrew; grab the release binary:
 curl -sL -o cvc5.zip "$(curl -sL https://api.github.com/repos/cvc5/cvc5/releases/latest \
   | grep browser_download_url | grep 'cvc5-macOS-arm64-static.zip' | cut -d'"' -f4)"
 unzip -q cvc5.zip && sudo cp cvc5-macOS-arm64-static/bin/cvc5 /usr/local/bin/
 ```
 
-然后 `lake build`。首次构建会拉 Duper 及其依赖（lean-auto、batteries），需要几分钟。
+Then `lake build`. The first build fetches Duper and its dependencies (lean-auto,
+batteries), which takes a few minutes.
 
-toolchain 锁在 `v4.30.0`：Duper 没有 `v4.31.0` 这个 tag（v4.30.0 直接跳到 v4.32.0），
-而 v4.30.0 是离本项目最近的可用版本。
+The toolchain is pinned to `v4.30.0`: Duper has no `v4.31.0` tag (it jumps from v4.30.0
+straight to v4.32.0), and v4.30.0 is the closest usable version.
 
-> `lakefile.toml` 里开了 `precompileModules = true`。tactic 代码默认走字节码解释器，
-> 慢一个数量级；编成动态库后 Lean 侧开销从 ~800ms 降到 ~130ms（首次调用还要
-> 2 秒扫一遍 environment，之后走进程内缓存）。
+> `lakefile.toml` sets `precompileModules = true`. Tactic code otherwise runs in the
+> bytecode interpreter, an order of magnitude slower; compiling to a shared library drops
+> the Lean-side cost from ~800ms to ~130ms per call. (The first call additionally spends
+> ~2s scanning the environment; after that it hits an in-process cache.)
 
-## 用法
+## Usage
 
 ```lean
 import Hammer
 
 example (a b c : Nat) (h1 : a ≤ b) (h2 : b ≤ c) : a ≤ c := by hammer
 example : ... := by hammer (timeout := 30, premises := 256)
-example : ... := by hammer (verbose := true)      -- 打印 SMT-LIB 问题与问题文件路径
-example : ... := by hammer (close := false)       -- 只报告，不闭合目标
+example : ... := by hammer (verbose := true)      -- print the SMT-LIB problem and its path
+example : ... := by hammer (close := false)       -- report only, leave the goal open
 ```
 
-| 选项 | 默认 | 含义 |
+| Option | Default | Meaning |
 | --- | --- | --- |
-| `premises` | 96 | 相关度过滤后保留的引理数 |
-| `timeout` | 10 | 每个求解器的墙钟超时（秒） |
-| `instances` | 8 | 单态化时每条引理最多产生的实例数 |
-| `solvers` | `"z3,cvc5"` | 参与竞速的后端，逗号分隔 |
-| `mono` | true | 是否单态化；关掉后多态引理会被整条丢弃 |
-| `verbose` | false | 打印 SMT-LIB 问题 |
-| `close` | true | 重建失败时，是否用信任公理闭合目标 |
-| `reconstruct` | true | 是否尝试用 Duper 逆向翻译 |
-| `assumeNonempty` | false | 见下面"排序非空" |
+| `premises` | 96 | Lemmas kept after relevance filtering |
+| `timeout` | 10 | Wall-clock timeout per solver, in seconds |
+| `instances` | 8 | Maximum instances generated per lemma during monomorphization |
+| `solvers` | `"z3,cvc5"` | Backends to race, comma-separated |
+| `mono` | true | Monomorphize; with it off, polymorphic lemmas are dropped entirely |
+| `verbose` | false | Print the SMT-LIB problem |
+| `close` | true | On failed reconstruction, close the goal with the trust axiom |
+| `reconstruct` | true | Attempt proof reconstruction with Duper |
+| `assumeNonempty` | false | See "Nonempty sorts" below |
 
-## 代码结构
+## Layout
 
-| 文件 | 职责 |
+| File | Responsibility |
 | --- | --- |
-| `Hammer/Basic.lean` | 配置、结果类型、信任公理 `trustSMT` |
-| `Hammer/Premise/Features.lean` | 前提的特征（陈述里出现的常量集） |
-| `Hammer/Premise/Collect.lean` | 扫 Environment / 局部上下文，带缓存 |
-| `Hammer/Premise/Select.lean` | MePo 相关度过滤 |
-| `Hammer/Translate/Encode.lean` | `Expr` → SMT-LIB，核心 |
-| `Hammer/Translate/Monomorphize.lean` | 目标驱动的类型实例化 |
-| `Hammer/Translate/Problem.lean` | 组装完整问题，管理 `:named` 标签 |
-| `Hammer/Translate/SMTLib.lean` | S-表达式与命令的表示/打印 |
-| `Hammer/Solver/Backend.lean` | 并行调 z3 / cvc5，解析 unsat core |
-| `Hammer/Tactic.lean` | tactic 前端与报告，逆向翻译的挂钩 |
-| `Hammer/Reconstruct.lean` | 用 Duper 重建证明；核心库不硬依赖它 |
+| `Hammer/Basic.lean` | Config, result types, the `trustSMT` axiom |
+| `Hammer/Premise/Features.lean` | Premise features (constants in a statement) |
+| `Hammer/Premise/Collect.lean` | Scan the Environment and local context, with caching |
+| `Hammer/Premise/Select.lean` | MePo relevance filtering |
+| `Hammer/Translate/Encode.lean` | `Expr` to SMT-LIB; the core of the project |
+| `Hammer/Translate/Monomorphize.lean` | Goal-driven type instantiation |
+| `Hammer/Translate/Problem.lean` | Assemble the problem, manage `:named` labels |
+| `Hammer/Solver/Backend.lean` | Race z3 / cvc5, parse the unsat core |
+| `Hammer/Translate/SMTLib.lean` | S-expression and command representation / printing |
+| `Hammer/Tactic.lean` | Tactic frontend, reporting, reconstruction hook |
+| `Hammer/Reconstruct.lean` | Rebuild proofs with Duper; the core library does not depend on it |
 
-## 编码的取舍
+## Encoding trade-offs
 
-CIC 比多排序一阶逻辑强得多，翻译必然是部分的。三条原则：
+CIC is far more expressive than many-sorted first-order logic, so the translation is
+necessarily partial. Three principles:
 
-1. **看得懂的精确翻译**：命题连接词、量词、等式、`Nat`/`Int`/`Real` 上的算术与比较。
-2. **看不懂的抽象成不解释符号**。抽象只丢等式信息，让问题更难而不是更容易，
-   所以 `unsat` 依然可信。
-3. **前提翻译失败就丢掉那一条**，只有目标翻译失败才算整体失败。
+1. **Translate precisely what we understand**: propositional connectives, quantifiers,
+   equality, and arithmetic and comparisons over `Nat` / `Int` / `Real`.
+2. **Abstract everything else into uninterpreted symbols.** Abstraction only discards
+   equational information, making the problem harder rather than easier, so `unsat` stays
+   trustworthy.
+3. **Drop a premise that fails to translate**; only a failure on the goal aborts the call.
 
-几个具体决定：
+A few concrete decisions:
 
-* **`Nat` → `Int` + 非负性**。每个 `Nat` 量词加 `≥ 0` 守卫，每个返回 `Nat` 的符号加
-  非负公理。
-* **全函数语义**。`a - b` 翻成 `(ite (<= b a) (- a b) 0)`；`a / 0` 翻成 `0`；
-  `a % 0` 翻成 `a`。Lean 的 `Int` 除法恰好就是 SMT-LIB 的欧几里得 `div`
-  （实测 `(-7)/2 = -4`、`(-7)%2 = 1`），所以只需补零除守卫。
-* **就地单态化**。`@f α inst a b` 里的类型参数和实例参数并入符号的**身份**，
-  不作为参数翻译：`@List.length Nat l` 和 `@List.length Int l` 得到两个不同的
-  SMT 符号。这样一阶编码器不必表达多态。
+* **`Nat` maps to `Int` plus non-negativity.** Every `Nat` quantifier gets a `≥ 0` guard
+  and every symbol returning `Nat` gets a non-negativity axiom.
+* **Total-function semantics.** `a - b` becomes `(ite (<= b a) (- a b) 0)`, `a / 0`
+  becomes `0`, `a % 0` becomes `a`. Lean's `Int` division happens to be exactly SMT-LIB's
+  Euclidean `div` (measured: `(-7)/2 = -4`, `(-7)%2 = 1`), so only the zero-divisor guard
+  is needed.
+* **Monomorphization on the spot.** In `@f α inst a b`, the type and instance arguments
+  fold into the symbol's **identity** rather than being translated as arguments:
+  `@List.length Nat l` and `@List.length Int l` become two different SMT symbols. This way
+  the first-order encoder never has to express polymorphism.
 
-## 已知的不健全风险（都已堵上，记在这里备查）
+## Known unsoundness risks (all closed; recorded here for reference)
 
-一个把真命题翻成矛盾的编码，会让 `hammer` "证明"假命题。
-`HammerTest/Soundness.lean` 就是守这一层的回归测试。
+An encoding that turns a true statement into a contradiction would let `hammer` "prove"
+false goals. `HammerTest/Soundness.lean` is the regression suite guarding that layer.
 
-**依赖排序。** `Fin.pos : ∀ {n} (i : Fin n), 0 < n`。把 `Fin n` 抽象成一个与 `n`
-无关的排序 `Fin`，公式就变成"只要 `Fin` 非空，所有 `n ≥ 0` 都满足 `0 < n`"——
-自相矛盾，于是任何目标都能被"证明"。这个 bug 是被 `f a = f b` 这个反例抓到的。
-现在编码器拒绝任何提到当前量词作用域内变量的排序或符号（`mentionsBound`）。
+**Dependent sorts.** `Fin.pos : ∀ {n} (i : Fin n), 0 < n`. Abstracting `Fin n` into a sort
+`Fin` independent of `n` turns the formula into "as long as `Fin` is nonempty, every
+`n ≥ 0` satisfies `0 < n`" -- self-contradictory, so any goal at all becomes "provable".
+This bug was caught by the counterexample `f a = f b`. The encoder now rejects any sort or
+symbol that mentions a variable in scope of an SMT quantifier (`mentionsBound`).
 
-**排序非空。** SMT-LIB 假设每个排序非空，Lean 的类型可以是空的。`∀ x : Empty, P x`
-在 Lean 里平凡为真，翻成 SMT 却是一条实打实的断言。默认要求 `Nonempty` 可合成，
-不然就丢掉这条前提；`assumeNonempty := true` 可以换取覆盖面，但 `unsat` 不再可信。
+**Nonempty sorts.** SMT-LIB assumes every sort is nonempty; Lean types can be empty.
+`∀ x : Empty, P x` holds vacuously in Lean but becomes a real assertion in SMT. By default
+we require a synthesizable `Nonempty` instance and drop the premise otherwise;
+`assumeNonempty := true` buys coverage at the cost of trusting `unsat`.
 
-代价是完备性：严格检查会让不少前提被丢掉（反例测试里 95 条能编码的只剩 16 条）。
+The price is completeness: strict checking drops a fair number of premises (in the
+counterexample tests, 95 encodable premises came down to 16).
 
-## 还没做的
+## Not done yet
 
-* **算术目标的逆向翻译**——上面那 7 个缺口。两条路：接一个 Lean 侧的算术 tactic
-  （`omega` 能关掉其中大部分）作为 Duper 之外的重建后端；或者老老实实从 SMT 的证明
-  日志（z3 的 `(get-proof)`、cvc5 的 Alethe）重建证明项，工程量大得多但覆盖面完整。
-* **高阶**。λ 项目前一律被抽象。接 TPTP THF + Zipperposition 会好很多。
-* **归纳**。SMT 不做归纳，凡是需要归纳的目标都出不来。
-* **前提选择用机器学习**。目前是纯符号的 MePo；Sledgehammer 的 MaSh 用的是
-  朴素贝叶斯/kNN，效果明显更好。
-* **倒排索引**。相关度过滤现在每轮线性扫全池。core Lean 的 37k 条够快，
-  上 Mathlib（~300k）需要按符号建倒排。
+* **Reconstruction for arithmetic goals** -- the 7 gaps above. Two routes: add a Lean-side
+  arithmetic tactic as a second reconstruction backend (`omega` would close most of them),
+  or do it properly and rebuild proof terms from the solvers' proof logs (z3's
+  `(get-proof)`, cvc5's Alethe) -- much more work, but complete coverage.
+* **Higher order.** Lambda terms are currently always abstracted. TPTP THF plus
+  Zipperposition would help a great deal here.
+* **Induction.** SMT does not do induction, so any goal needing it is out of reach.
+* **Machine-learned premise selection.** This is plain symbolic MePo; Sledgehammer's MaSh
+  uses naive Bayes / kNN and does noticeably better.
+* **An inverted index.** Relevance filtering currently scans the whole pool each round.
+  Fast enough for core Lean's 37k theorems; Mathlib (~300k) would need a symbol index.
 
-## 许可
+## License
 
-Apache License 2.0，见 [`LICENSE`](LICENSE)。这也是 Lean 生态的惯例——Mathlib、
-Duper、lean-auto 都用它。
+Apache License 2.0, see [`LICENSE`](LICENSE). This is also the Lean ecosystem convention --
+Mathlib, Duper, and lean-auto all use it.

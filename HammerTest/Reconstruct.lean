@@ -1,12 +1,14 @@
 import Hammer
 
 /-!
-# 逆向翻译的覆盖面实验
+# Measuring reconstruction coverage
 
-和 `HammerTest/Basic.lean` 同一批目标，但改成具名定理，好用 `#print axioms` 检查：
+The same goals as `HammerTest/Basic.lean`, but as named theorems so `#print axioms` can
+tell us how each one was closed:
 
-* 带 `Hammer.trustSMT` → Duper 没能重建，目标是靠信任公理关掉的
-* 只有 `propext / Classical.choice / Quot.sound` → Duper 重建成功，这是真证明
+* `Hammer.trustSMT` present: Duper could not rebuild it; the trust axiom closed the goal.
+* only `propext / Classical.choice / Quot.sound`: Duper rebuilt it, and this is a real
+  proof.
 -/
 
 set_option maxHeartbeats 4000000

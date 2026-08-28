@@ -2,18 +2,20 @@ import Hammer.Premise.Collect
 import Hammer.Basic
 
 /-!
-# 相关度过滤（MePo 风格）
+# Relevance filtering (MePo style)
 
-从目标的符号集出发迭代扩张：每轮接受与当前"相关符号集"重合度足够高的引理，
-把它们的符号并进来，然后降低阈值再来一轮。稀有符号权重更高——
-和目标共享 `Nat.succ_le_succ` 里那种冷门符号，比共享 `Eq` 有意义得多。
+Start from the goal's symbol set and expand iteratively: each round accepts the lemmas
+whose overlap with the current relevant-symbol set is high enough, folds their symbols
+into that set, then lowers the threshold and goes again. Rare symbols carry more weight --
+sharing something obscure like `Nat.succ_le_succ` with the goal says far more than
+sharing `Eq`.
 -/
 
 namespace Hammer
 
 open Lean Meta
 
-/-- 符号出现频率表。 -/
+/-- Symbol frequency table. -/
 abbrev FreqTable := Std.HashMap Name Nat
 
 def buildFreqTable (facts : Array Fact) : FreqTable := Id.run do
@@ -23,12 +25,13 @@ def buildFreqTable (facts : Array Fact) : FreqTable := Id.run do
       t := t.insert s ((t.getD s 0) + 1)
   return t
 
-/-- 稀有符号权重高。`freq` 越大权重越接近 1，越小则可到 3 左右。 -/
+/-- Rare symbols weigh more. Weight tends to 1 as `freq` grows, and reaches roughly 3
+for the rarest symbols. -/
 def symWeight (t : FreqTable) (s : Name) : Float :=
   let f := (t.getD s 1).toFloat
   1.0 + 2.0 / Float.log (2.0 + f)
 
-/-- 一条引理相对当前相关符号集的得分，取值 `[0,1]`。 -/
+/-- A lemma's score against the current relevant-symbol set, in `[0,1]`. -/
 def factScore (t : FreqTable) (relevant : Std.HashSet Name) (f : Fact) : Float := Id.run do
   if f.symbols.isEmpty then return 0.0
   let mut hit := 0.0
@@ -41,8 +44,8 @@ def factScore (t : FreqTable) (relevant : Std.HashSet Name) (f : Fact) : Float :
   return hit / total
 
 /--
-迭代相关度过滤。`goalSyms` 是目标（含局部假设）的符号集，返回按得分从高到低排序的
-前 `maxPremises` 条全局引理。
+Iterative relevance filtering. `goalSyms` is the symbol set of the goal together with its
+local hypotheses; the result is the top `maxPremises` global lemmas, best score first.
 -/
 def selectPremises (cfg : Hammer.Config) (goalSyms : Std.HashSet Name)
     (pool : Array Fact) : Array Fact := Id.run do
@@ -64,7 +67,7 @@ def selectPremises (cfg : Hammer.Config) (goalSyms : Std.HashSet Name)
       round := round + 1
       if threshold < 0.05 then break
       continue
-    -- 同一轮里，短的引理优先。
+    -- Within a round, prefer shorter lemmas.
     let sorted := newlyChosen.qsort fun (f1, s1) (f2, s2) =>
       if s1 == s2 then sizeOf' f1.type < sizeOf' f2.type else s1 > s2
     for (f, s) in sorted do

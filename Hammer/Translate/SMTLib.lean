@@ -1,15 +1,16 @@
 import Lean
 
 /-!
-# SMT-LIB 2 的表示与打印
+# Representing and printing SMT-LIB 2
 
-用一个极小的 S-表达式类型承载项与公式，再加一层命令层。这样翻译阶段不必和
-"某个具体的 SMT 语法树"较劲，加新理论只是多产生几个 atom。
+Terms and formulas ride on a minimal S-expression type, with a thin command layer on top.
+That way the translator never wrestles with a bespoke SMT syntax tree, and supporting a
+new theory just means emitting a few more atoms.
 -/
 
 namespace Hammer
 
-/-- S-表达式：SMT-LIB 的全部语法都是它。 -/
+/-- S-expressions. All of SMT-LIB's syntax is one of these. -/
 inductive Sexp where
   | atom (s : String)
   | app  (xs : List Sexp)
@@ -17,7 +18,7 @@ inductive Sexp where
 
 namespace Sexp
 
-/-- `(f a b …)`。 -/
+/-- `(f a b …)`. -/
 def mk (f : String) (args : List Sexp) : Sexp :=
   if args.isEmpty then .atom f else .app (.atom f :: args)
 
@@ -29,7 +30,7 @@ def not' : Sexp → Sexp
   | .atom "false" => true'
   | e => mk "not" [e]
 
-/-- 折叠成 `(and …)`，并消去平凡情形。 -/
+/-- Fold into `(and …)`, collapsing the trivial cases. -/
 def andN (xs : List Sexp) : Sexp :=
   let xs := xs.filter (· != true')
   match xs with
@@ -55,15 +56,15 @@ instance : ToString Sexp := ⟨render⟩
 
 end Sexp
 
-/-- 一条 SMT-LIB 命令。只保留我们真正会产生的那几种。 -/
+/-- An SMT-LIB command. Only the handful we actually emit. -/
 inductive Command where
   /-- `(declare-sort S 0)` -/
   | declareSort (name : String)
-  /-- `(declare-fun f (A B) R)`；`args` 为空即常量。 -/
+  /-- `(declare-fun f (A B) R)`. An empty `args` means a constant. -/
   | declareFun (name : String) (args : List String) (ret : String)
-  /-- `(assert (! φ :named lbl))`；`label` 为 `none` 时不加标注。 -/
+  /-- `(assert (! φ :named lbl))`. A `none` label emits a plain assert. -/
   | assert (label : Option String) (body : Sexp)
-  /-- 原样输出的一行，用于 `set-option` / `set-logic` 等。 -/
+  /-- A line emitted verbatim, for `set-option`, `set-logic`, comments, and the like. -/
   | raw (line : String)
 
 namespace Command
@@ -80,15 +81,15 @@ instance : ToString Command := ⟨render⟩
 
 end Command
 
-/-- 一个完整的 SMT-LIB 问题：序言 + 声明 + 断言。 -/
+/-- A complete SMT-LIB problem: preamble, declarations, assertions. -/
 structure Problem where
-  /-- 是否请求 unsat core（会给每条断言加 `:named` 标签）。 -/
+  /-- Whether to request an unsat core, which also gives every assert a `:named` label. -/
   produceCores : Bool := true
   commands     : Array Command := #[]
 
 namespace Problem
 
-/-- 渲染成可直接喂给 z3 / cvc5 的文本。 -/
+/-- Render to text that z3 / cvc5 can consume directly. -/
 def render (p : Problem) : String := Id.run do
   let mut out : Array String := #[]
   out := out.push "(set-logic ALL)"

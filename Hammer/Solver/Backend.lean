@@ -2,17 +2,18 @@ import Hammer.Basic
 import Hammer.Translate.SMTLib
 
 /-!
-# 外部求解器的调用与结果解析
+# Invoking external solvers and parsing their answers
 
-把 SMT-LIB 文本写到临时文件，并行跑所有配置的后端，取第一个给出 `unsat` 的。
-超时由求解器自己的选项负责，所以即使我们提前返回，遗留进程也会在超时后自杀。
+Write the SMT-LIB text to a temporary file, run every configured backend in parallel, and
+take the first one that answers `unsat`. Timeouts are enforced by the solvers' own options,
+so even when we return early any straggler process kills itself once its timeout hits.
 -/
 
 namespace Hammer
 
 open Lean
 
-/-- 内置后端表。`hammer` 的 `solvers` 配置按 `name` 在这里查。 -/
+/-- The built-in backend table. `hammer`'s `solvers` option looks names up here. -/
 def knownBackends : Array Backend := #[
   { name := "z3"
     exe  := "z3"
@@ -26,7 +27,7 @@ def knownBackends : Array Backend := #[
 def backendByName? (n : String) : Option Backend :=
   knownBackends.find? (·.name == n)
 
-/-- 在系统临时目录下造一个唯一的 `.smt2` 路径。 -/
+/-- Build a unique `.smt2` path under the system temporary directory. -/
 private def freshProblemPath : IO System.FilePath := do
   let base : System.FilePath :=
     match (← IO.getEnv "TMPDIR") with
@@ -38,7 +39,7 @@ private def freshProblemPath : IO System.FilePath := do
   let salt ← IO.rand 0 999999
   return dir / s!"q-{stamp}-{salt}.smt2"
 
-/-- 从求解器输出里抠出 unsat core 的标签。 -/
+/-- Pull the unsat core labels out of the solver's output. -/
 private def parseCore (rest : List String) : Array String := Id.run do
   let text := String.intercalate " " rest
   let mut out : Array String := #[]
@@ -52,7 +53,7 @@ private def parseCore (rest : List String) : Array String := Id.run do
   if !cur.isEmpty then out := out.push cur
   return out
 
-/-- 解析 z3 / cvc5 的标准输出。 -/
+/-- Parse the standard output of z3 / cvc5. -/
 def parseOutput (stdout stderr : String) (exitCode : UInt32) : SolverResult := Id.run do
   let lines := (stdout.splitOn "\n").map (·.trimAscii.toString) |>.filter (!·.isEmpty)
   let mut idx := 0
@@ -66,16 +67,16 @@ def parseOutput (stdout stderr : String) (exitCode : UInt32) : SolverResult := I
     idx := idx + 1
   if exitCode != 0 || !stderr.isEmpty then
     return .error (if stderr.isEmpty then s!"exit code {exitCode}" else stderr.trimAscii.toString)
-  return .unknown "求解器没有给出 sat/unsat/unknown"
+  return .unknown "solver reported neither sat, unsat, nor unknown"
 
-/-- 结果的可读摘要，用于 `verbose` 报告。 -/
+/-- A readable summary of a result, for the report. -/
 def SolverResult.describe : SolverResult → String
-  | .unsat core => s!"unsat (core 大小 {core.size})"
+  | .unsat core => s!"unsat (core size {core.size})"
   | .sat => "sat"
   | .unknown r => s!"unknown: {r}"
   | .error m => s!"error: {m}"
 
-/-- 跑单个后端。任何异常都收敛成 `.error`。 -/
+/-- Run a single backend. Any exception collapses into `.error`. -/
 def runBackend (b : Backend) (timeout : Nat) (path : System.FilePath) :
     BaseIO SolverResult := do
   let act : IO SolverResult := do
@@ -83,17 +84,18 @@ def runBackend (b : Backend) (timeout : Nat) (path : System.FilePath) :
     return parseOutput out.stdout out.stderr out.exitCode
   match ← act.toBaseIO with
   | .ok r => return r
-  | .error e => return .error s!"无法运行 {b.exe}: {e}"
+  | .error e => return .error s!"could not run {b.exe}: {e}"
 
-/-- 一次求解的完整记录，供报告使用。 -/
+/-- The full record of one solving attempt, for reporting. -/
 structure Attempt where
   backend : String
   result  : SolverResult
   millis  : Nat
 
 /--
-把问题喂给所有后端并行竞速。返回全部尝试记录（第一个 `unsat` 出现后不再等待余下的）。
-`problemText` 会被写到临时文件，路径一并返回以便 `verbose` 时提示。
+Race the problem across every backend in parallel. Returns all attempt records; once the
+first `unsat` arrives we stop waiting on the rest. `problemText` is written to a temporary
+file whose path is returned too, so `verbose` can point at it.
 -/
 def solve (cfg : Config) (problemText : String) :
     IO (Array Attempt × System.FilePath) := do
@@ -101,11 +103,11 @@ def solve (cfg : Config) (problemText : String) :
   IO.FS.writeFile path problemText
   let backends := cfg.solvers.filterMap backendByName? |>.toArray
   if backends.isEmpty then
-    return (#[⟨"<none>", .error "没有可用后端；检查 solvers 配置", 0⟩], path)
+    return (#[⟨"<none>", .error "no usable backend; check the solvers option", 0⟩], path)
   let start ← IO.monoMsNow
   let tasks ← backends.mapM fun b =>
     return (b.name, ← BaseIO.asTask (runBackend b cfg.timeout path))
-  -- 轮询：一旦有人报 unsat 就立刻返回。
+  -- Poll: return as soon as anyone reports unsat.
   let mut done : Array Attempt := #[]
   let mut pending := tasks
   while !pending.isEmpty do
