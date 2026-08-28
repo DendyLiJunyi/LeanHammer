@@ -1,84 +1,91 @@
 import Lean
 
 /-!
-# LeanHammer — 基础类型与配置
+# Core types and configuration
 
-本文件定义 hammer 全流程共享的配置、结果类型，以及用于"无重建"收尾的信任公理。
+Configuration, result types, and the trust axiom used when proof reconstruction is
+unavailable or fails. Everything here is shared across the whole pipeline.
 -/
 
 namespace Hammer
 
 open Lean
 
-/-- 外部 SMT 求解器的后端描述。 -/
+/-- Description of an external SMT solver backend. -/
 structure Backend where
-  /-- 用于报告和 `solvers` 配置的名字，例如 `"z3"`。 -/
+  /-- Name used in reports and in the `solvers` option, e.g. `"z3"`. -/
   name    : String
-  /-- 可执行文件名（在 `PATH` 上查找）。 -/
+  /-- Executable name, looked up on `PATH`. -/
   exe     : String
-  /-- 生成命令行参数：给定超时（秒）和问题文件路径。 -/
+  /-- Build the command line, given a timeout in seconds and the problem file. -/
   args    : Nat → System.FilePath → Array String
   deriving Inhabited
 
-/-- `hammer` 的配置。 -/
+/-- Configuration for `hammer`. -/
 structure Config where
-  /-- 前提选择后交给求解器的最大引理数。 -/
+  /-- Maximum number of lemmas handed to the solver after relevance filtering. -/
   maxPremises  : Nat := 96
-  /-- 每个求解器的墙钟超时（秒）。 -/
+  /-- Wall-clock timeout per solver, in seconds. -/
   timeout      : Nat := 10
-  /-- 要并行竞速的后端名字。 -/
+  /-- Names of the backends to race in parallel. -/
   solvers      : List String := ["z3", "cvc5"]
-  /-- 打印 SMT-LIB 问题与求解器原始输出。 -/
+  /-- Print the SMT-LIB problem and the raw solver output. -/
   verbose      : Bool := false
-  /-- 请求 unsat core，用于报告"真正用到的前提"。 -/
+  /-- Request an unsat core, so the report can name the premises actually used. -/
   unsatCores   : Bool := true
-  /-- 对多态引理做单态化实例化。 -/
+  /-- Instantiate polymorphic lemmas at concrete types. -/
   monomorphize : Bool := true
-  /-- 单态化时每条引理最多产生多少个实例。 -/
+  /-- Maximum number of instances generated per lemma during monomorphization. -/
   maxInstances : Nat := 8
-  /-- 若为 `false`，只报告不闭合目标。 -/
+  /-- When `false`, report but leave the goal open. -/
   closeGoal    : Bool := true
   /--
-  拿到 unsat core 后，尝试用 Duper 在 Lean 内部重证一遍。
+  After an unsat core comes back, try to reprove the goal inside Lean with Duper.
 
-  成功则目标由真正的证明项闭合，不沾 `trustSMT`；失败就退回信任公理。
-  这是"外包版"的逆向翻译：外部求解器负责搜索，Duper 负责重建。
-  需要导入 `Hammer.Reconstruct` 才会生效。
+  On success the goal is closed by a genuine proof term and `trustSMT` never appears;
+  on failure we fall back to the trust axiom. This is proof reconstruction, outsourced:
+  the external solver does the search, Duper does the rebuilding.
+  Only takes effect once `Hammer.Reconstruct` is imported.
   -/
   reconstruct  : Bool := true
-  /-- 单次 Duper 重建的心跳预算。 -/
+  /-- Heartbeat budget for a single Duper reconstruction attempt. -/
   reconstructHeartbeats : Nat := 400000
   /--
-  允许为"无法确认非空"的 Lean 类型声明不解释排序。
+  Allow declaring an uninterpreted sort for a Lean type that cannot be shown nonempty.
 
-  SMT-LIB 假设每个排序非空，而 Lean 的类型可以是空的：`∀ x : Empty, P x` 在 Lean 里
-  平凡为真，翻成 SMT 却成了一条实打实的断言。默认 (`false`) 要求 `Nonempty` 可合成，
-  宁可丢前提也不冒险；置 `true` 换取覆盖面，但 `unsat` 不再可信。
+  SMT-LIB assumes every sort is nonempty, whereas Lean types can be empty:
+  `∀ x : Empty, P x` holds vacuously in Lean but becomes a real assertion in SMT.
+  The default (`false`) requires a synthesizable `Nonempty` instance and would rather
+  drop a premise than risk it. Setting `true` buys coverage at the cost of trusting
+  `unsat`.
   -/
   assumeNonempty : Bool := false
   deriving Inhabited, Repr
 
-/-- 求解器对一个问题的回答。 -/
+/-- A solver's answer to one problem. -/
 inductive SolverResult where
-  /-- 问题不可满足：目标成立。`core` 是 unsat core 中的断言名。 -/
+  /-- Unsatisfiable, i.e. the goal follows. `core` holds the names of the asserts in the
+  unsat core. -/
   | unsat (core : Array String)
-  /-- 问题可满足：目标（在本次编码下）不成立。 -/
+  /-- Satisfiable: under this encoding, the goal does not follow. -/
   | sat
-  /-- 超时、内存不足或求解器放弃。 -/
+  /-- Timeout, out of memory, or the solver gave up. -/
   | unknown (reason : String)
-  /-- 调用求解器本身失败（未安装、崩溃等）。 -/
+  /-- Invoking the solver itself failed (not installed, crashed, ...). -/
   | error (msg : String)
   deriving Inhabited, Repr
 
 /--
-信任公理。当外部 SMT 求解器判定 `¬ p` 与选出的前提不可满足时，`hammer` 用它闭合目标。
+The trust axiom. `hammer` closes the goal with it once an external SMT solver reports
+that the selected premises together with the negated goal are unsatisfiable.
 
-**它不是一个证明。** 这条公理让 `p` 无条件成立，因此靠它闭合的定理都会在
-`#print axioms` 里显示 `Hammer.trustSMT`。
+**This is not a proof.** The axiom makes `p` hold unconditionally, so any theorem closed
+through it shows `Hammer.trustSMT` under `#print axioms`.
 
-只有在逆向翻译失败时才会走到这里。导入 `Hammer.Reconstruct` 后，`hammer` 会先把
-unsat core 交给 Duper 在 Lean 内部重证；成功的话目标由真证明项闭合，这条公理不出现。
-Duper 没有算术决策过程，所以纯算术目标目前仍会落到这里。
+We only reach it when proof reconstruction fails. With `Hammer.Reconstruct` imported,
+`hammer` first hands the unsat core to Duper to be reproved inside Lean; when that
+succeeds the goal is closed by a real proof term and this axiom never appears. Duper has
+no arithmetic decision procedure, so purely arithmetic goals still land here.
 -/
 axiom trustSMT (p : Prop) : p
 

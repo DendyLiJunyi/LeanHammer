@@ -2,8 +2,9 @@ name = "lean-smt-hammer"
 version = "0.1.0"
 defaultTargets = ["Hammer"]
 
-# Duper 是一个跑在 Lean 里的 superposition 证明器，产出真正的 Lean 证明项。
-# 我们用它把 unsat core 换成一个可过内核的证明——即"外包版"的逆向翻译。
+# Duper is a superposition prover that runs inside Lean and emits genuine Lean proof
+# terms. We use it to turn an unsat core into a kernel-checkable proof -- i.e. proof
+# reconstruction, outsourced.
 [[require]]
 name = "duper"
 git = "https://github.com/leanprover-community/duper.git"
@@ -11,8 +12,9 @@ rev = "v4.30.0"
 
 [[lean_lib]]
 name = "Hammer"
-# tactic 代码默认走字节码解释器，慢一个数量级；编成动态库后 hammer 的 Lean 侧
-# 开销从数百毫秒降到几十毫秒。
+# Tactic code runs in the bytecode interpreter by default, which is an order of
+# magnitude slower. Compiling to a shared library drops hammer's Lean-side cost from
+# a few hundred milliseconds to a few tens.
 precompileModules = true
 
 [[lean_lib]]
