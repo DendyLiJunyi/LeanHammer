@@ -166,3 +166,8 @@ CIC 比多排序一阶逻辑强得多，翻译必然是部分的。三条原则�
   朴素贝叶斯/kNN，效果明显更好。
 * **倒排索引**。相关度过滤现在每轮线性扫全池。core Lean 的 37k 条够快，
   上 Mathlib（~300k）需要按符号建倒排。
+
+## 许可
+
+Apache License 2.0，见 [`LICENSE`](LICENSE)。这也是 Lean 生态的惯例——Mathlib、
+Duper、lean-auto 都用它。
