@@ -186,6 +186,14 @@ counterexample tests, 95 encodable premises came down to 16).
 * **An inverted index.** Relevance filtering currently scans the whole pool each round.
   Fast enough for core Lean's 37k theorems; Mathlib (~300k) would need a symbol index.
 
+## Project history
+
+This project originated during the author's visit to the University of Edinburgh
+in November 2025. Its surviving Git records begin in August 2026; the commit
+sequence was reconstructed retrospectively in 2026. Individual original
+development dates are unknown. See [HISTORY.md](HISTORY.md) for the evidence,
+inferred stages, and preservation details.
+
 ## License
 
 Apache License 2.0, see [`LICENSE`](LICENSE). This is also the Lean ecosystem convention --
