@@ -43,28 +43,77 @@ theorem demo (l₁ l₂ : List Nat) : (l₁ ++ l₂).length = l₁.length + l₂
 Even when reconstruction fails the report earns its keep: it names the lemmas that suffice
 to derive the goal, which you can then feed to `omega` or `simp` for a real proof.
 
-## How much actually gets reconstructed
+## Evaluation
 
-`HammerTest/Reconstruct.lean` measures this over 19 goals, adjudicated by `#print axioms`:
+`HammerBench/Chrono.lean` runs the standard hammer evaluation (as in Sledgehammer's
+"Judgment Day" and the LeanHammer Mathlib evaluations): **reprove existing library
+theorems using only premises declared strictly before them**. Modules sit in the
+environment in import order and declarations within a module in declaration order, so
+this excludes the theorem itself and everything derived from it.
 
-| Category | Reconstructed | Notes |
-| --- | --- | --- |
-| Propositional logic | 3 / 3 | Duper's home turf |
-| Uninterpreted functions and equality | 3 / 3 | likewise |
-| Quantifiers | 2 / 2 | likewise |
-| Needs a lemma from the environment | 2 / 2 | `List.length_append` and friends |
-| Integer / natural arithmetic | 2 / 9 | **the main gap** |
-| **Total** | **12 / 19** | |
+* **Targets:** `theorem`s from core Lean's `Init.Data.Nat`, `Init.Data.Int` and
+  `Init.Data.List` (4972 candidates after dropping elaborator noise and generated
+  equation lemmas), sampled deterministically by name hash.
+* **Settings:** default `Config` (96 premises, 10 s per solver, z3 and cvc5 racing).
+  Universe parameters are instantiated at `1`, then `intros`.
+* **Solved:** some solver returned `unsat`. **Reconstructed:** Duper closed the goal from
+  the unsat core, and the term passes the kernel with no `trustSMT` or `sorryAx`.
 
-The reason for the gap is clear: **Duper is pure first-order equational reasoning with no
-arithmetic decision procedure**. For goals like `a ≤ b → a ≤ b + 1`, `n - (n+1) = 0`, or
-`n / 0 = 0`, the core often holds just one or two hypotheses while all the real work sits
-in z3's linear arithmetic theory -- which Duper cannot pick up. (The two that do succeed
-are special cases: `x < y → x + 1 ≤ y` has a ready-made lemma on `Int`, and `(-7)/2 = -4`
-is a closed term that computes.)
+Results on 367 targets:
 
-The time cost is small: about 0.6 seconds across all 19 goals, roughly 30ms each. Duper
-either succeeds quickly or gives up quickly.
+| Area | Targets | Solved | Reconstructed | Reconstructed / solved |
+| --- | --- | --- | --- | --- |
+| `Nat` | 98 | 65 (66.3%) | 12 (12.2%) | 18.5% |
+| `Int` | 107 | 61 (57.0%) | 12 (11.2%) | 19.7% |
+| `List` | 162 | 5 (3.1%) | 5 (3.1%) | 100% |
+| **Total** | **367** | **131 (35.7%)** | **29 (7.9%)** | **22.1%** |
+
+Six of the solved targets have an earlier theorem with an identical statement under
+another name (e.g. `Nat.add_sub_cancel` / `Nat.add_sub_self_right`). Without them the
+totals are 34.1% solved and 6.8% reconstructed.
+
+What the numbers say:
+
+* **Arithmetic: solved often, rarely reconstructed.** Of the solved goals, 30 use no
+  library premise at all and 48 use exactly one, so the work happens in z3's linear
+  arithmetic. **Duper is pure first-order equational reasoning with no arithmetic
+  decision procedure**, so it cannot pick that work up.
+* **`List` is blocked at encoding, not at search.** 42 of the 162 `List` targets fail
+  before a solver runs. Most fail because the polymorphic `α` has no synthesizable
+  `Nonempty` instance (see "Nonempty sorts" below), and a few because `<` / `≤` are used
+  on lists. The few that do reach the solver all reconstruct.
+* **Failure breakdown:** 187 solver timeouts, 30 `sat` / `unknown` (the selected premises
+  do not suffice), 46 encoding errors.
+* z3 wins 126 races and cvc5 wins 7. The median solver time on solved goals is 38 ms.
+
+To reproduce (about 27 minutes on 4 parallel shards):
+
+```bash
+for i in 0 1 2 3; do
+  BENCH_N=400 BENCH_SHARDS=4 BENCH_SHARD=$i BENCH_OUT=shard$i.tsv \
+    lake env lean HammerBench/Chrono.lean &
+done; wait
+```
+
+Each TSV row records the status, winning solver, solver time, core size and whether
+reconstruction succeeded. Because the candidate filter was tightened after the run, the
+first 400 candidates now differ slightly from the 367 reported above.
+
+### Unit suite
+
+`HammerTest/` also contains 19 hand-written goals covering each encoding feature. All 19
+are solved, and `HammerTest/Reconstruct.lean` reconstructs 12 of them, judged by
+`#print axioms`:
+
+| Category | Reconstructed |
+| --- | --- |
+| Propositional logic | 3 / 3 |
+| Uninterpreted functions and equality | 3 / 3 |
+| Quantifiers | 2 / 2 |
+| Needs a lemma from the environment | 2 / 2 |
+| Integer / natural arithmetic | 2 / 9 |
+
+`HammerTest/Soundness.lean` checks that `hammer` fails on 5 unprovable statements.
 
 ## Installation
 
@@ -127,6 +176,7 @@ example : ... := by hammer (close := false)       -- report only, leave the goal
 | `Hammer/Translate/SMTLib.lean` | S-expression and command representation / printing |
 | `Hammer/Tactic.lean` | Tactic frontend, reporting, reconstruction hook |
 | `Hammer/Reconstruct.lean` | Rebuild proofs with Duper; the core library does not depend on it |
+| `HammerBench/Chrono.lean` | Chronological library-reproving benchmark (see "Evaluation") |
 
 ## Encoding trade-offs
 
@@ -174,7 +224,8 @@ counterexample tests, 95 encodable premises came down to 16).
 
 ## Not done yet
 
-* **Reconstruction for arithmetic goals** -- the 7 gaps above. Two routes: add a Lean-side
+* **Reconstruction for arithmetic goals** -- about 100 solved-but-unreconstructed
+  `Nat` / `Int` targets in the evaluation above. Two routes: add a Lean-side
   arithmetic tactic as a second reconstruction backend (`omega` would close most of them),
   or do it properly and rebuild proof terms from the solvers' proof logs (z3's
   `(get-proof)`, cvc5's Alethe) -- much more work, but complete coverage.
